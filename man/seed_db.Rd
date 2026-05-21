@@ -4,11 +4,13 @@
 \alias{seed_db}
 \title{Seed the Sales Database}
 \usage{
-seed_db(db_path = system.file("extdata", "sales.db", package = "datfloish"))
+seed_db(db_path = NULL)
 }
 \arguments{
-\item{db_path}{Path to the SQLite database file. Defaults to the bundled
-`sales.db` in `inst/extdata/` via [base::system.file()].}
+\item{db_path}{Path to the SQLite database file. Defaults to `NULL`, which
+resolves to the bundled `sales.db` in `inst/extdata/`. If that file does
+not yet exist (e.g. before the first seed), the path is constructed from
+the package root and the directory is created automatically.}
 }
 \value{
 Invisibly returns the number of rows inserted.

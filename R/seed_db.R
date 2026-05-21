@@ -5,8 +5,10 @@
 #' Re-running this function drops and recreates the table, providing a clean
 #' slate for testing.
 #'
-#' @param db_path Path to the SQLite database file. Defaults to the bundled
-#'   `sales.db` in `inst/extdata/` via [base::system.file()].
+#' @param db_path Path to the SQLite database file. Defaults to `NULL`, which
+#'   resolves to the bundled `sales.db` in `inst/extdata/`. If that file does
+#'   not yet exist (e.g. before the first seed), the path is constructed from
+#'   the package root and the directory is created automatically.
 #'
 #' @return Invisibly returns the number of rows inserted.
 #' @export
@@ -16,7 +18,16 @@
 #' seed_db()                        # re-seed the bundled sales.db
 #' seed_db(db_path = tempfile(fileext = ".db"))  # seed a fresh temporary db
 #' }
-seed_db <- function(db_path = system.file("extdata", "sales.db", package = "datfloish")) {
+seed_db <- function(db_path = NULL) {
+  if (is.null(db_path)) {
+    db_path <- system.file("extdata", "sales.db", package = "datfloish")
+    if (!nzchar(db_path)) {
+      # sales.db doesn't exist yet; construct path into inst/extdata
+      extdata_dir <- file.path(system.file(package = "datfloish"), "extdata")
+      dir.create(extdata_dir, recursive = TRUE, showWarnings = FALSE)
+      db_path <- file.path(extdata_dir, "sales.db")
+    }
+  }
   con <- dbConnect(SQLite(), db_path)
   on.exit(dbDisconnect(con))
 
