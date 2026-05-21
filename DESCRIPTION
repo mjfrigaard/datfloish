@@ -1,0 +1,24 @@
+Package: datfloish
+Title: Sales Dashboard Shiny Application
+Version: 0.0.1
+Authors@R:
+    person("First", "Last", email = "first.last@example.com",
+           role = c("aut", "cre"))
+Description: A Shiny application demonstrating the use of reactivePoll()
+    with a SQLite backend. Includes interactive controls for inserting sales
+    records and visualising how polling checks and data fetches differ in
+    frequency.
+License: MIT + file LICENSE
+Encoding: UTF-8
+RoxygenNote: 8.0.0
+Imports:
+    bslib,
+    DBI,
+    RSQLite,
+    shiny
+Suggests:
+    knitr,
+    rmarkdown,
+    testthat (>= 3.0.0)
+VignetteBuilder: knitr
+Config/testthat/edition: 3

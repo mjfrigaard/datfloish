@@ -1,0 +1,158 @@
+---
+title: "Efficient Database Polling with reactivePoll()"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Efficient Database Polling with reactivePoll()}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+```{r setup}
+library(datfloish)
+```
+
+## The polling problem
+
+A live dashboard needs to periodically check whether its data source has
+changed. The simplest approach is to re-query the database on a fixed timer
+and update every output regardless of whether anything is new:
+
+```{r naive, eval = FALSE}
+# Naive approach: re-query on every tick
+sales_data <- reactive({
+  invalidateLater(5000)
+  con <- dbConnect(SQLite(), db_path)
+  on.exit(dbDisconnect(con))
+  dbGetQuery(con, "SELECT * FROM sales ORDER BY updated_at DESC")
+})
+```
+
+This works, but it conflates two separate concerns:
+
+1. **Has the data changed?** — a cheap question answered by a single scalar.
+2. **What is the new data?** — an expensive question that transfers every row.
+
+When nothing has changed, the full query runs anyway, wasting database I/O,
+network bandwidth (for remote databases), and serialisation time every single
+tick.
+
+## Separating check from fetch
+
+`reactivePoll()` solves this by accepting two functions instead of one:
+
+| Argument | Purpose | Ideal cost |
+|---|---|---|
+| `checkFunc` | Returns a scalar that changes when data changes | Very low |
+| `valueFunc` | Returns the full result set | Higher |
+
+Shiny runs `checkFunc` on every `intervalMillis` tick. `valueFunc` only
+runs when the value returned by `checkFunc` differs from the previous call.
+If nothing has changed, `valueFunc` is never invoked.
+
+```{r reactive-poll-sketch, eval = FALSE}
+reactivePoll(
+  intervalMillis = 5000,
+  session        = session,
+
+  checkFunc = function() {
+    con <- dbConnect(SQLite(), db_path)
+    on.exit(dbDisconnect(con))
+    dbGetQuery(con, "SELECT MAX(updated_at) FROM sales")[[1]]  # one value
+  },
+
+  valueFunc = function() {
+    con <- dbConnect(SQLite(), db_path)
+    on.exit(dbDisconnect(con))
+    dbGetQuery(con, "SELECT * FROM sales ORDER BY updated_at DESC")  # full table
+  }
+)
+```
+
+The database only bears the cost of a full table scan when a new record has
+actually been written.
+
+## How datfloish implements this
+
+`mod_sales_table_server()` wraps the pattern above and exposes four
+`reactiveVal`s so that the rest of the UI can visualise the difference in
+real time:
+
+```{r mod-server-excerpt, eval = FALSE}
+check_count <- reactiveVal(0)
+fetch_count <- reactiveVal(0)
+
+sales_data <- reactivePoll(
+  intervalMillis = interval_ms,
+  session        = session,
+
+  checkFunc = function() {
+    check_count(isolate(check_count()) + 1)      # increments every tick
+    last_check(format(Sys.time(), "%H:%M:%S"))
+
+    con <- dbConnect(SQLite(), db_path)
+    on.exit(dbDisconnect(con))
+    if (!dbExistsTable(con, "sales")) return(NA)
+    dbGetQuery(con, "SELECT MAX(updated_at) FROM sales")[[1]]
+  },
+
+  valueFunc = function() {
+    fetch_count(isolate(fetch_count()) + 1)      # increments only on change
+    last_fetch(format(Sys.time(), "%H:%M:%S"))
+
+    con <- dbConnect(SQLite(), db_path)
+    on.exit(dbDisconnect(con))
+    dbGetQuery(con, "SELECT * FROM sales ORDER BY updated_at DESC")
+  }
+)
+```
+
+## Observing the difference
+
+Launch the app, wait a minute without adding any sales, and watch the value
+boxes:
+
+- **Checks Performed** increments every 5 seconds — one lightweight
+  `SELECT MAX(updated_at)` per tick.
+- **Fetches Performed** stays fixed — `valueFunc` has nothing new to return.
+
+Now click **Add Sale**. The next `checkFunc` call returns a new
+`MAX(updated_at)`, Shiny detects the change, and `valueFunc` fires exactly
+once. The Fetches counter increments by one; the table updates.
+
+```{r launch, eval = FALSE}
+launch_app()
+```
+
+After running the app for two minutes with five sales added, you might see:
+
+| Metric | Value |
+|---|---|
+| Checks Performed | 24 |
+| Fetches Performed | 5 |
+
+Twenty-four cheap timestamp reads; five full-table fetches. Without
+`reactivePoll()` the same period would have required twenty-four full-table
+reads instead.
+
+## When the savings matter most
+
+The efficiency gap widens as:
+
+- **Rows increase** — a full `SELECT *` becomes more expensive.
+- **Poll interval decreases** — more ticks per minute means more skipped
+  fetches.
+- **Write frequency is low relative to polling frequency** — the common case
+  for dashboards where data changes infrequently but must appear promptly.
+- **The database is remote** — network latency and connection overhead make
+  each avoided round-trip meaningful.
+
+For a local SQLite database with ten rows, the savings are negligible. For a
+PostgreSQL table with millions of rows polled every second, they are
+substantial.

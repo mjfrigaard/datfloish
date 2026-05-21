@@ -1,0 +1,195 @@
+---
+title: "Module Architecture"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Module Architecture}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+```{r setup}
+library(datfloish)
+```
+
+## Overview
+
+datfloish is built from three Shiny modules, each responsible for a single
+slice of the application. The modules are wired together in `app_server()`,
+which threads a shared `db_path` and `interval_ms` through the pieces that
+need them.
+
+```
+app_ui()                          app_server()
+├── mod_add_sale_ui()             ├── mod_add_sale_server()     ─── writes to db
+├── mod_value_boxes_ui()          ├── mod_sales_table_server()  ─── polls db, returns stats
+└── mod_sales_table_ui()          └── mod_value_boxes_server()  ─── renders stats
+```
+
+The only cross-module communication is a named list of `reactiveVal`s
+(`poll_stats`) that `mod_sales_table_server()` returns and
+`mod_value_boxes_server()` consumes. Everything else is isolated inside its
+own module namespace.
+
+## The three modules
+
+### `mod_add_sale` — writing to the database
+
+This module owns the sidebar form. Its server function listens for the
+"Add Sale" button and inserts one row into the `sales` table on each click:
+
+```{r add-sale-server, eval = FALSE}
+mod_add_sale_server <- function(id, db_path) {
+  moduleServer(id, function(input, output, session) {
+    observeEvent(input$add, {
+      con <- dbConnect(SQLite(), db_path)
+      on.exit(dbDisconnect(con))
+      dbExecute(
+        con,
+        "INSERT INTO sales (product, amount, updated_at) VALUES (?, ?, ?)",
+        params = list(input$product, input$amount,
+                      format(Sys.time(), "%Y-%m-%d %H:%M:%S"))
+      )
+    })
+  })
+}
+```
+
+The module does not return a value; it acts purely through the side effect of
+writing to the database. The polling module detects that write on its next
+`checkFunc` tick.
+
+### `mod_sales_table` — polling and displaying
+
+This is the core module. Its server function creates a `reactivePoll()` that:
+
+1. Runs `checkFunc` every `interval_ms` milliseconds — a lightweight
+   `SELECT MAX(updated_at)` query.
+2. Runs `valueFunc` only when `checkFunc` returns a new value — the full
+   `SELECT *` that feeds the table.
+
+Alongside the poll, it tracks four `reactiveVal`s and returns them so other
+modules can display them:
+
+```{r sales-table-return, eval = FALSE}
+list(
+  check_count = check_count,   # number of checkFunc calls
+  fetch_count = fetch_count,   # number of valueFunc calls
+  last_check  = last_check,    # timestamp of most recent check
+  last_fetch  = last_fetch     # timestamp of most recent fetch
+)
+```
+
+The table output (`output$sales_table`) is rendered inside the module — no
+data leaves the namespace.
+
+### `mod_value_boxes` — displaying poll statistics
+
+This module receives the `reactiveVal` list from `mod_sales_table_server()`
+and renders it into four `bslib::value_box()` elements. It holds no state
+of its own and performs no database access:
+
+```{r value-boxes-server, eval = FALSE}
+mod_value_boxes_server <- function(id, stats) {
+  moduleServer(id, function(input, output, session) {
+    output$check_count <- renderText(as.character(stats$check_count()))
+    output$fetch_count <- renderText(as.character(stats$fetch_count()))
+    output$last_check  <- renderText(stats$last_check())
+    output$last_fetch  <- renderText(stats$last_fetch())
+  })
+}
+```
+
+Keeping the display logic separate from the polling logic means the value
+boxes can be restyled or replaced without touching the polling code.
+
+## Wiring in `app_server()`
+
+`app_server()` is the only place where the three modules are aware of each
+other. It is deliberately thin:
+
+```{r app-server, eval = FALSE}
+app_server <- function(
+    db_path     = system.file("extdata", "sales.db", package = "datfloish"),
+    interval_ms = 5000) {
+  function(input, output, session) {
+
+    # mod_sales_table_server returns the reactiveVal list
+    poll_stats <- mod_sales_table_server("sales",
+      db_path     = db_path,
+      interval_ms = interval_ms
+    )
+
+    # db_path only; does not need poll_stats
+    mod_add_sale_server("add_sale", db_path = db_path)
+
+    # receives poll_stats; does not need db_path
+    mod_value_boxes_server("stats", stats = poll_stats)
+  }
+}
+```
+
+`db_path` flows into two modules independently — the add-sale module and the
+sales-table module each open and close their own connections as needed. There
+is no shared connection object, which avoids concurrency issues with SQLite.
+
+## Data flow
+
+The diagram below shows how information moves through the application on a
+typical user interaction (adding a sale):
+
+```
+User clicks "Add Sale"
+        │
+        ▼
+mod_add_sale_server()
+  INSERT INTO sales ...
+        │
+        │  (database write)
+        ▼
+mod_sales_table_server() — checkFunc tick
+  SELECT MAX(updated_at)  ← new value detected
+        │
+        ▼
+mod_sales_table_server() — valueFunc fires
+  SELECT * FROM sales
+  fetch_count + 1
+  last_fetch updated
+        │
+        ├──► output$sales_table   (table re-renders)
+        │
+        └──► poll_stats (reactiveVals)
+                  │
+                  ▼
+        mod_value_boxes_server()
+          Fetches counter increments
+          Last Fetch timestamp updates
+```
+
+Between sales, only `checkFunc` runs. The value boxes, table, and
+`fetch_count` remain unchanged until the next write reaches the database.
+
+## The `db_path` convention
+
+Every function that touches the database accepts a `db_path` argument and
+defaults to the bundled database:
+
+```{r db-path, eval = FALSE}
+db_path = system.file("extdata", "sales.db", package = "datfloish")
+```
+
+This means `launch_app()` works out of the box with no setup. Passing a
+custom path — such as a `tempfile()` — is the standard pattern in tests and
+when running multiple isolated app instances.
+
+```{r custom-db, eval = FALSE}
+my_db <- tempfile(fileext = ".db")
+seed_db(db_path = my_db)
+launch_app(db_path = my_db)
+```
